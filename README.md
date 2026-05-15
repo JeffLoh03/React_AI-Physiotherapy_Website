@@ -1,4 +1,4 @@
-# Physio AI App (Rebuilt)
+# AI-Physiotherapy Repetition Counter
 
 A web-based **AI physiotherapy assistant** that uses **MediaPipe pose estimation**, a trained **exercise classification model**, and a **rule-based repetition counter** to monitor rehabilitation exercises in real time.
 
