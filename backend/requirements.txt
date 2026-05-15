@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+websockets
+mediapipe
+opencv-python-headless
+numpy
+scikit-learn
+joblib
+pandas

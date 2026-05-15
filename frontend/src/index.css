@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+@theme {
+  --color-neon-purple: #b026ff;
+  --color-neon-cyan: #00f3ff;
+  --color-bg-black: #050505;
+}
+
+body {
+  background-color: var(--color-bg-black);
+  color: white;
+  font-family: 'Inter', sans-serif;
+  overflow-x: hidden;
+}
+
+.text-neon-purple {
+  color: var(--color-neon-purple);
+  text-shadow: 0 0 10px rgba(176, 38, 255, 0.5);
+}
+
+.text-neon-cyan {
+  color: var(--color-neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.5);
+}
+
+.border-neon-purple {
+  border-color: var(--color-neon-purple);
+  box-shadow: 0 0 10px rgba(176, 38, 255, 0.3);
+}
+
+.border-neon-cyan {
+  border-color: var(--color-neon-cyan);
+  box-shadow: 0 0 10px rgba(0, 243, 255, 0.3);
+}
+
+.bg-neon-purple-glow {
+  background-color: rgba(176, 38, 255, 0.1);
+  box-shadow: 0 0 20px rgba(176, 38, 255, 0.2);
+}
+
+.bg-neon-cyan-glow {
+  background-color: rgba(0, 243, 255, 0.1);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.2);
+}
