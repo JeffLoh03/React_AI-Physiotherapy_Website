@@ -6,17 +6,44 @@ import pandas as pd
 import mediapipe as mp
 import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import os
 import joblib
 from collections import deque, Counter
 from typing import Deque, Dict, List, Optional, Tuple
+from pydantic import BaseModel
 
-from pose_features import calculate_angle
+from pose_features import FULL_WINDOW_FEATURE_NAMES, RealtimeFeatureExtractor, calculate_angle
 from session_manager import SessionManager
+from auth import create_access_token, decode_access_token, get_current_user, require_role
+from database import (
+    init_db, create_user, authenticate_user, get_user_profile,
+    save_session, get_user_sessions, search_patient_by_username,
+    get_patient_analytics, create_care_relationship, remove_care_relationship,
+    is_doctor_for_patient,
+    get_doctor_patients, create_plan_assignment, get_assignment,
+    get_patient_assignments, update_assignment_status
+)
 
 app = FastAPI()
+
+# Enable CORS
+cors_origins = [origin.strip() for origin in os.getenv(
+    "CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
+).split(",") if origin.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize database
+init_db()
 
 # ----------------------------
 # Paths
@@ -34,7 +61,7 @@ landmarker = None
 classifier = None
 feature_order: Optional[List[str]] = None
 ex_names: Dict[str, str] = {}
-session_manager = SessionManager()
+rehabilitation_plans = {}
 
 # ----------------------------
 # Realtime config
@@ -42,7 +69,7 @@ session_manager = SessionManager()
 WINDOW_SIZE = 30
 WINDOW_STEP = 15
 
-PRED_BUFFER = 20
+PRED_BUFFER = 8
 VOTE_DOMINANCE = 0.60
 MIN_VALID_VOTES = 3
 
@@ -54,11 +81,22 @@ LOCK_SECONDS = 2.5
 LOCK_MIN_CONF = 0.35
 
 REP_COOLDOWN = 0.8
-ANGLE_SMOOTH_W = 5
+ANGLE_SMOOTH_W = 3
+PHASE_CONFIRM_FRAMES = 2
+FEEDBACK_CHANGE_INTERVAL = 1.5
+NO_POSE_CONFIRM_FRAMES = 5
 
 USE_MOVEMENT_GATE = True
 MOVE_STD_THRESHOLD = 0.8
 MOVE_SIGNAL = "knee_mean_deg"
+
+# ----------------------------
+# Motion Speed Detection
+# ----------------------------
+USE_SPEED_DETECTION = True
+SPEED_SLOW_THRESHOLD = 30.0  # degrees per second - warning
+SPEED_FAST_THRESHOLD = 50.0  # degrees per second - critical
+SPEED_CHECK_WINDOW = 0.1  # seconds between speed checks
 
 SIGNALS = [
     "shoulder_abd_deg",
@@ -96,6 +134,46 @@ LM = {
     "LEFT_ANKLE": 27,
     "RIGHT_ANKLE": 28,
 }
+
+# ----------------------------
+# Pydantic Models
+# ----------------------------
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    role: str  # "patient" or "doctor"
+    doctor_invite_code: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class AuthResponse(BaseModel):
+    success: bool
+    user_id: Optional[str] = None
+    username: Optional[str] = None
+    role: Optional[str] = None
+    access_token: Optional[str] = None
+    message: str
+
+class PlanAssignmentRequest(BaseModel):
+    patient_id: str
+    plan_id: str
+    notes: str = ""
+    start_date: Optional[str] = None
+
+class AssignmentStatusRequest(BaseModel):
+    status: str
+
+class UserProfileResponse(BaseModel):
+    user_id: str
+    username: str
+    role: str
+    total_xp: int
+    current_streak: int
+    total_sessions: int
+    best_form_quality: float
+    last_session_date: Optional[str]
 
 # ----------------------------
 # MediaPipe setup
@@ -286,39 +364,158 @@ def stable_mode(labels: Deque[str]) -> str:
     return "Unknown"
 
 
+def steady_feedback(candidate: str, state: Dict[str, object]) -> str:
+    """Rate-limit instruction changes while allowing the current text to persist."""
+    if not candidate:
+        return ""
+    now = time.time()
+    current = str(state.get("text", ""))
+    changed_at = float(state.get("changed_at", 0.0))
+    if candidate == current:
+        return candidate
+    if not current or now - changed_at >= FEEDBACK_CHANGE_INTERVAL:
+        state["text"] = candidate
+        state["changed_at"] = now
+        return candidate
+    return ""
+
+
 # ----------------------------
 # Angle per exercise
 # ----------------------------
-def angle_for_exercise(display_label: str, landmarks) -> Tuple[float, float]:
-    lbl = (display_label or "").lower()
+REP_PROFILES: Dict[str, Dict[str, object]] = {
+    "shoulder_abduction": {
+        "min_excursion": 18.0, "target": 90.0, "tolerance": 25.0,
+    },
+    "shoulder_vw": {
+        "min_excursion": 18.0, "target": 100.0, "tolerance": 25.0,
+    },
+    "inclined_pushup": {
+        "min_excursion": 25.0, "target": 95.0, "tolerance": 25.0,
+    },
+    "hip_abduction": {
+        "min_excursion": 12.0, "target": 125.0, "tolerance": 25.0,
+    },
+    "forward_lunge": {
+        "min_excursion": 22.0, "target": 105.0, "tolerance": 25.0,
+    },
+    "squat": {
+        "min_excursion": 22.0, "target": 105.0, "tolerance": 25.0,
+    },
+}
 
-    p_shoulder = [landmarks[12].x, landmarks[12].y]
-    p_elbow = [landmarks[14].x, landmarks[14].y]
-    p_wrist = [landmarks[16].x, landmarks[16].y]
-    p_hip = [landmarks[24].x, landmarks[24].y]
-    p_knee = [landmarks[26].x, landmarks[26].y]
-    p_ankle = [landmarks[28].x, landmarks[28].y]
 
-    angle_value = calculate_angle(p_shoulder, p_elbow, p_wrist)
-    target = 90.0
+def exercise_key(display_label: str) -> str:
+    label = (display_label or "").lower()
+    if "hip abduction" in label:
+        return "hip_abduction"
+    if "v-w" in label or "vw" in label:
+        return "shoulder_vw"
+    if "push" in label:
+        return "inclined_pushup"
+    if "lunge" in label:
+        return "forward_lunge"
+    if "squat" in label:
+        return "squat"
+    return "shoulder_abduction"
 
-    if "squat" in lbl or "lunge" in lbl:
-        angle_value = calculate_angle(p_hip, p_knee, p_ankle)
-        target = 90.0
 
-    elif "hip abduction" in lbl:
-        angle_value = calculate_angle(p_shoulder, p_hip, p_knee)
-        target = 120.0
+EXPECTED_CLASS_BY_EXERCISE = {
+    "shoulder_abduction": "Ex1",
+    "shoulder_vw": "Ex2",
+    "inclined_pushup": "Ex3",
+    "hip_abduction": "Ex4",
+    "forward_lunge": "Ex5",
+    "squat": "Ex6",
+}
 
-    elif "shoulder" in lbl:
-        angle_value = calculate_angle(p_hip, p_shoulder, p_elbow)
-        target = 90.0
 
-    elif "push" in lbl or "v-w" in lbl or "vw" in lbl:
-        angle_value = calculate_angle(p_shoulder, p_elbow, p_wrist)
-        target = 90.0
+def expected_class_for_exercise(display_label: str) -> str:
+    return EXPECTED_CLASS_BY_EXERCISE[exercise_key(display_label)]
 
-    return float(angle_value), float(target)
+
+def plan_target_for_exercise(
+    plan_exercises: Dict[str, Dict[str, object]], display_label: str
+) -> Optional[Dict[str, object]]:
+    """Match model display names and shorter plan names to the same exercise."""
+    wanted_key = exercise_key(display_label)
+    return next(
+        (
+            target
+            for name, target in plan_exercises.items()
+            if exercise_key(name) == wanted_key
+        ),
+        None,
+    )
+
+
+def _pixel_point(landmarks, index: int, frame_width: int, frame_height: int) -> List[float]:
+    return [landmarks[index].x * frame_width, landmarks[index].y * frame_height]
+
+
+def _side_angle(
+    landmarks, indices: Tuple[int, int, int], frame_width: int, frame_height: int
+) -> Tuple[float, float]:
+    visibility = min(float(getattr(landmarks[index], "visibility", 1.0)) for index in indices)
+    points = [_pixel_point(landmarks, index, frame_width, frame_height) for index in indices]
+    return float(calculate_angle(points[0], points[1], points[2])), visibility
+
+
+def _bilateral_metric(
+    landmarks,
+    left_indices: Tuple[int, int, int],
+    right_indices: Tuple[int, int, int],
+    frame_width: int,
+    frame_height: int,
+    mode: str = "average",
+) -> Tuple[float, str]:
+    left_angle, left_visibility = _side_angle(
+        landmarks, left_indices, frame_width, frame_height
+    )
+    right_angle, right_visibility = _side_angle(
+        landmarks, right_indices, frame_width, frame_height
+    )
+    visible = []
+    if left_visibility >= 0.45:
+        visible.append((left_angle, "left"))
+    if right_visibility >= 0.45:
+        visible.append((right_angle, "right"))
+    if not visible:
+        visible = [(left_angle, "left"), (right_angle, "right")]
+    if mode == "minimum":
+        return min(visible, key=lambda item: item[0])
+    return float(sum(item[0] for item in visible) / len(visible)), "both" if len(visible) == 2 else visible[0][1]
+
+
+def angle_for_exercise(
+    display_label: str, landmarks, frame_width: int, frame_height: int
+) -> Tuple[float, float, str, str]:
+    """Return visibility-aware pixel-space motion angle, target, key, and measured side."""
+    key = exercise_key(display_label)
+    profile = REP_PROFILES[key]
+    if key == "shoulder_abduction":
+        angle, side = _bilateral_metric(
+            landmarks, (23, 11, 13), (24, 12, 14), frame_width, frame_height
+        )
+    elif key in {"shoulder_vw", "inclined_pushup"}:
+        angle, side = _bilateral_metric(
+            landmarks, (11, 13, 15), (12, 14, 16), frame_width, frame_height
+        )
+    elif key == "hip_abduction":
+        angle, side = _bilateral_metric(
+            landmarks, (11, 23, 25), (12, 24, 26), frame_width, frame_height,
+            mode="minimum",
+        )
+    elif key == "forward_lunge":
+        angle, side = _bilateral_metric(
+            landmarks, (23, 25, 27), (24, 26, 28), frame_width, frame_height,
+            mode="minimum",
+        )
+    else:
+        angle, side = _bilateral_metric(
+            landmarks, (23, 25, 27), (24, 26, 28), frame_width, frame_height
+        )
+    return angle, float(profile["target"]), key, side
 
 
 # ----------------------------
@@ -326,9 +523,9 @@ def angle_for_exercise(display_label: str, landmarks) -> Tuple[float, float]:
 # Counts only complete cycle:
 # high -> low -> high OR low -> high -> low
 # ----------------------------
-def rep_update(display_label: str, angle_value: float, state: Dict[str, object]) -> int:
-    lbl = (display_label or "").lower()
-
+def rep_update(display_label: str, angle_value: float, state: Dict[str, object]) -> Tuple[int, Optional[str]]:
+    key = exercise_key(display_label)
+    profile = REP_PROFILES[key]
     # Smooth angle
     buf = state.setdefault("angle_buffer", [])
     buf.append(float(angle_value))
@@ -340,75 +537,96 @@ def rep_update(display_label: str, angle_value: float, state: Dict[str, object])
 
     reps = int(state.get("reps", 0))
     last_rep_time = float(state.get("last_rep_time", 0.0))
-    stage = state.get("stage", "start")
+    stage = str(state.get("stage", "waiting_start"))
+    if stage == "start":
+        stage = "waiting_start"
 
-    # start_is_high = True:
-    # standing/straight position -> bent/down position -> standing/straight position = 1 rep
-    if "squat" in lbl or "lunge" in lbl:
-        start_th = 160.0
-        opposite_th = 95.0
-        start_is_high = True
-
-    elif "push" in lbl:
-        start_th = 150.0
-        opposite_th = 85.0
-        start_is_high = True
-
-    elif "v-w" in lbl or "vw" in lbl:
-        start_th = 150.0
-        opposite_th = 85.0
-        start_is_high = True
-
-    # start_is_high = False:
-    # arm/leg down position -> raised/abducted position -> back down = 1 rep
-    elif "shoulder" in lbl:
-        start_th = 40.0
-        opposite_th = 75.0
-        start_is_high = False
-
-    elif "hip abduction" in lbl:
-        start_th = 40.0
-        opposite_th = 70.0
-        start_is_high = False
-
-    else:
-        start_th = 150.0
-        opposite_th = 85.0
-        start_is_high = True
-
+    # Motion speed detection
+    last_angle = float(state.get("last_angle", angle_s))
+    last_angle_time = float(state.get("last_angle_time", time.time()))
     now = time.time()
+    time_delta = max(now - last_angle_time, 0.01)  # Avoid division by zero
 
-    if start_is_high:
-        # Example: squat = standing -> down -> standing
-        if stage == "start":
-            if angle_s < opposite_th:
-                stage = "opposite"
+    speed_warning = None
+    if USE_SPEED_DETECTION and time_delta >= SPEED_CHECK_WINDOW:
+        angular_velocity = abs(angle_s - last_angle) / time_delta
+        state["angular_velocity"] = angular_velocity
 
-        elif stage == "opposite":
-            if angle_s > start_th:
-                if now - last_rep_time >= REP_COOLDOWN:
-                    reps += 1
-                    stage = "start"
-                    state["last_rep_time"] = now
+        if angular_velocity > SPEED_FAST_THRESHOLD:
+            speed_warning = "TOO_FAST"
+        elif angular_velocity > SPEED_SLOW_THRESHOLD:
+            speed_warning = "SLOW_DOWN"
 
+        state["last_angle"] = angle_s
+        state["last_angle_time"] = now
+
+    state["speed_warning"] = speed_warning
+
+    min_excursion = float(profile.get("min_excursion", 20.0))
+    start_anchor = float(state.get("start_anchor", angle_s))
+    active_anchor = float(state.get("active_anchor", angle_s))
+
+    # Calibrate to the user's real starting pose. The first meaningful movement
+    # may increase or decrease the angle, so both A -> B -> A directions work.
+    start_condition = True
+    delta_from_start = angle_s - start_anchor
+    active_condition = abs(delta_from_start) >= min_excursion
+
+    motion_direction = int(state.get("motion_direction", 0))
+    if stage == "active" and motion_direction:
+        active_anchor = (
+            max(active_anchor, angle_s)
+            if motion_direction > 0
+            else min(active_anchor, angle_s)
+        )
+        state["active_anchor"] = active_anchor
+
+    return_tolerance = max(8.0, min_excursion * 0.45)
+    if motion_direction > 0:
+        reversal = active_anchor - angle_s
+        returned_to_start = angle_s <= start_anchor + return_tolerance
+    elif motion_direction < 0:
+        reversal = angle_s - active_anchor
+        returned_to_start = angle_s >= start_anchor - return_tolerance
     else:
-        # Example: shoulder abduction = arm down -> arm up -> arm down
-        if stage == "start":
-            if angle_s > opposite_th:
-                stage = "opposite"
+        reversal = 0.0
+        returned_to_start = False
+    return_condition = returned_to_start and reversal >= min_excursion * 0.65
 
-        elif stage == "opposite":
-            if angle_s < start_th:
-                if now - last_rep_time >= REP_COOLDOWN:
-                    reps += 1
-                    stage = "start"
-                    state["last_rep_time"] = now
+    expected_condition = (
+        start_condition if stage == "waiting_start"
+        else active_condition if stage == "ready"
+        else return_condition
+    )
+    phase_frames = int(state.get("phase_frames", 0)) + 1 if expected_condition else 0
+
+    if phase_frames >= PHASE_CONFIRM_FRAMES:
+        previous_stage = stage
+        if stage == "waiting_start":
+            stage = "ready"
+            state["start_anchor"] = angle_s
+        elif stage == "ready":
+            stage = "active"
+            state["active_anchor"] = angle_s
+            state["motion_direction"] = 1 if delta_from_start > 0 else -1
+        elif stage == "active" and now - last_rep_time >= REP_COOLDOWN:
+            reps += 1
+            stage = "ready"
+            state["start_anchor"] = angle_s
+            state["motion_direction"] = 0
+            state["last_rep_time"] = now
+            print(f"[REP] {display_label} count={reps} angle={angle_s:.1f}")
+        phase_frames = 0
+        if previous_stage != stage:
+            print(f"[PHASE] {display_label} {previous_stage}->{stage} angle={angle_s:.1f}")
 
     state["stage"] = stage
+    state["phase_frames"] = phase_frames
     state["reps"] = reps
     state["angle_smoothed"] = angle_s
 
-    return reps
+    return reps, speed_warning
+
 
 
 # ----------------------------
@@ -416,12 +634,14 @@ def rep_update(display_label: str, angle_value: float, state: Dict[str, object])
 # ----------------------------
 @app.on_event("startup")
 def startup_event():
-    global landmarker, classifier, feature_order, ex_names
+    global landmarker, classifier, feature_order, ex_names, rehabilitation_plans
 
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=VisionRunningMode.IMAGE,
         num_poses=1,
+        min_pose_detection_confidence=0.35,
+        min_pose_presence_confidence=0.35,
     )
 
     landmarker = PoseLandmarker.create_from_options(options)
@@ -434,6 +654,11 @@ def startup_event():
     with open(FEATURE_ORDER_PATH, "r", encoding="utf-8") as f:
         feature_order = json.load(f)
 
+    if feature_order != FULL_WINDOW_FEATURE_NAMES:
+        raise RuntimeError(
+            "feature_order.json does not match the training-matched realtime extractor"
+        )
+
     print(f"SUCCESS: Loaded feature_order.json ({len(feature_order)} features)")
 
     with open(EX_NAMES_PATH, "r", encoding="utf-8") as f:
@@ -441,15 +666,204 @@ def startup_event():
 
     print("SUCCESS: Loaded exercise_names.json")
 
+    # Load rehabilitation plans
+    plans_path = os.path.join(BASE_DIR, "rehabilitation_plans.json")
+    try:
+        with open(plans_path, "r", encoding="utf-8") as f:
+            rehabilitation_plans = json.load(f)
+        print(f"SUCCESS: Loaded rehabilitation plans ({len(rehabilitation_plans.get('plans', []))} plans)")
+    except Exception as e:
+        print(f"WARNING: Could not load rehabilitation plans: {e}")
+
 
 # ----------------------------
-# WebSocket
+# API Endpoints
+# ----------------------------
+@app.get("/api/rehabilitation-plans")
+async def get_rehabilitation_plans(user: Dict[str, object] = Depends(get_current_user)):
+    return rehabilitation_plans
+
+
+# ----------------------------
+# Authentication Endpoints
+# ----------------------------
+@app.post("/api/auth/register", response_model=AuthResponse)
+async def register(request: RegisterRequest):
+    """Register a new user (patient or doctor)"""
+    if request.role not in ["patient", "doctor"]:
+        raise HTTPException(status_code=400, detail="Role must be 'patient' or 'doctor'")
+    if len(request.username.strip()) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    if len(request.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if request.role == "doctor":
+        invite_code = os.getenv("DOCTOR_INVITE_CODE")
+        if not invite_code or request.doctor_invite_code != invite_code:
+            raise HTTPException(status_code=403, detail="A valid clinician invite code is required")
+
+    user_id = create_user(request.username, request.password, request.role)
+
+    if user_id is None:
+        return AuthResponse(
+            success=False,
+            message="Username already exists"
+        )
+
+    return AuthResponse(
+        success=True,
+        user_id=user_id,
+        username=request.username.strip(),
+        role=request.role,
+        access_token=create_access_token(user_id, request.username.strip(), request.role),
+        message="Registration successful"
+    )
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def login(request: LoginRequest):
+    """Login user and return user_id"""
+    user_id = authenticate_user(request.username, request.password)
+
+    if user_id is None:
+        return AuthResponse(
+            success=False,
+            message="Invalid username or password"
+        )
+
+    profile = get_user_profile(user_id)
+    return AuthResponse(
+        success=True,
+        user_id=user_id,
+        username=profile['username'],
+        role=profile['role'],
+        access_token=create_access_token(user_id, profile['username'], profile['role']),
+        message="Login successful"
+    )
+
+
+@app.get("/api/user/profile/{user_id}", response_model=UserProfileResponse)
+async def get_profile(user_id: str, user: Dict[str, object] = Depends(get_current_user)):
+    """Get user profile"""
+    if user["sub"] != user_id:
+        if user["role"] != "doctor" or not is_doctor_for_patient(str(user["sub"]), user_id):
+            raise HTTPException(status_code=403, detail="You do not have access to this profile")
+    profile = get_user_profile(user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return profile
+
+
+@app.get("/api/user/sessions/{user_id}")
+async def get_sessions(user_id: str, user: Dict[str, object] = Depends(get_current_user)):
+    """Get user's session history"""
+    if user["sub"] != user_id:
+        if user["role"] != "doctor" or not is_doctor_for_patient(str(user["sub"]), user_id):
+            raise HTTPException(status_code=403, detail="You do not have access to these sessions")
+    sessions = get_user_sessions(user_id)
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+@app.get("/api/doctor/search-patient/{username}")
+async def doctor_search_patient(username: str, user: Dict[str, object] = Depends(get_current_user)):
+    """Doctor searches for patient by username"""
+    require_role(user, "doctor")
+    patient = search_patient_by_username(username)
+    if patient is None:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    patient["is_linked"] = is_doctor_for_patient(str(user["sub"]), patient["user_id"])
+    return patient
+
+
+@app.post("/api/doctor/patients/{patient_id}")
+async def link_patient(patient_id: str, user: Dict[str, object] = Depends(get_current_user)):
+    require_role(user, "doctor")
+    if not create_care_relationship(str(user["sub"]), patient_id):
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return {"success": True}
+
+
+@app.get("/api/doctor/patients")
+async def list_doctor_patients(user: Dict[str, object] = Depends(get_current_user)):
+    require_role(user, "doctor")
+    return {"patients": get_doctor_patients(str(user["sub"]))}
+
+
+@app.delete("/api/doctor/patients/{patient_id}")
+async def unlink_patient(patient_id: str, user: Dict[str, object] = Depends(get_current_user)):
+    require_role(user, "doctor")
+    if not remove_care_relationship(str(user["sub"]), patient_id):
+        raise HTTPException(status_code=404, detail="Linked patient not found")
+    return {"success": True}
+
+
+@app.get("/api/doctor/patient-analytics/{patient_id}")
+async def get_patient_analytics_endpoint(
+    patient_id: str,
+    days: int = Query(default=30, ge=1, le=3650),
+    user: Dict[str, object] = Depends(get_current_user),
+):
+    """Doctor gets patient analytics"""
+    require_role(user, "doctor")
+    if not is_doctor_for_patient(str(user["sub"]), patient_id):
+        raise HTTPException(status_code=403, detail="Link this patient before viewing analytics")
+    analytics = get_patient_analytics(patient_id, days)
+    if not analytics:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return analytics
+
+
+@app.post("/api/doctor/assignments")
+async def assign_plan(request: PlanAssignmentRequest, user: Dict[str, object] = Depends(get_current_user)):
+    require_role(user, "doctor")
+    plan = next(
+        (item for item in rehabilitation_plans.get("plans", []) if item.get("planId") == request.plan_id),
+        None,
+    )
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Rehabilitation plan not found")
+    assignment = create_plan_assignment(
+        str(user["sub"]), request.patient_id, plan, request.notes, request.start_date
+    )
+    if assignment is None:
+        raise HTTPException(status_code=403, detail="Link this patient before assigning a plan")
+    return assignment
+
+
+@app.get("/api/patient/assignments")
+async def patient_assignments(
+    active_only: bool = True, user: Dict[str, object] = Depends(get_current_user)
+):
+    require_role(user, "patient")
+    return {"assignments": get_patient_assignments(str(user["sub"]), active_only)}
+
+
+@app.patch("/api/patient/assignments/{assignment_id}")
+async def set_assignment_status(
+    assignment_id: str,
+    request: AssignmentStatusRequest,
+    user: Dict[str, object] = Depends(get_current_user),
+):
+    require_role(user, "patient")
+    if request.status not in {"active", "completed", "paused"}:
+        raise HTTPException(status_code=400, detail="Invalid assignment status")
+    if not update_assignment_status(assignment_id, str(user["sub"]), request.status):
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    return {"success": True}
+
+
 # ----------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    token = websocket.query_params.get("token", "")
+    auth_user = decode_access_token(token)
+    if auth_user is None or auth_user.get("role") != "patient":
+        await websocket.close(code=1008, reason="Authentication required")
+        return
     await websocket.accept()
+    current_user_id = str(auth_user["sub"])
+    session_manager = SessionManager()
+    feature_extractor = RealtimeFeatureExtractor()
 
-    frame_buf: Deque[Dict[str, float]] = deque(maxlen=WINDOW_SIZE)
     pred_buf: Deque[str] = deque(maxlen=PRED_BUFFER)
 
     stable_ex = "Unknown"
@@ -457,15 +871,22 @@ async def websocket_endpoint(websocket: WebSocket):
     lock_until = 0.0
 
     rep_state: Dict[str, object] = {
-        "stage": "start",
+        "stage": "waiting_start",
+        "phase_frames": 0,
         "reps": 0,
         "last_rep_time": 0.0,
         "angle_buffer": [],
         "current_exercise": "Unknown",
     }
 
-    step_counter = 0
     last_conf = 0.0
+    manual_exercise: Optional[str] = None
+    selected_plan_id: Optional[str] = None
+    selected_assignment_id: Optional[str] = None
+    plan_exercises: Dict[str, Dict[str, object]] = {}
+    last_logged_stable = ""
+    no_pose_frames = 0
+    feedback_state: Dict[str, object] = {"text": "", "changed_at": 0.0}
 
     try:
         while True:
@@ -476,27 +897,109 @@ async def websocket_endpoint(websocket: WebSocket):
                 cmd = message["command"]
 
                 if cmd == "START_SESSION":
-                    session_manager.start_session()
-                    frame_buf.clear()
+                    selected_plan_id = message.get("selectedPlan")
+                    selected_assignment_id = message.get("assignmentId")
+                    selected_plan = next(
+                        (item for item in rehabilitation_plans.get("plans", []) if item.get("planId") == selected_plan_id),
+                        None,
+                    )
+                    if selected_assignment_id:
+                        assignment = get_assignment(selected_assignment_id)
+                        if (
+                            not assignment
+                            or assignment["patient_id"] != current_user_id
+                            or assignment["status"] != "active"
+                        ):
+                            await websocket.send_text(json.dumps({"error": "Invalid plan assignment"}))
+                            continue
+                        selected_plan = assignment["plan"]
+                        selected_plan_id = assignment["plan_id"]
+                    if selected_plan is None:
+                        await websocket.send_text(json.dumps({"error": "Invalid rehabilitation plan"}))
+                        continue
+
+                    plan_exercises = {item["name"]: item for item in selected_plan.get("exercises", [])}
+                    manual_exercise = next(iter(plan_exercises), None)
+                    session_manager.start_session(selected_plan_id, selected_assignment_id)
+                    feature_extractor.reset()
                     pred_buf.clear()
 
                     stable_ex = "Unknown"
+                    last_logged_stable = ""
                     lock_ex = "Unknown"
                     lock_until = 0.0
 
                     rep_state = {
-                        "stage": "start",
+                        "stage": "waiting_start",
+                        "phase_frames": 0,
                         "reps": 0,
                         "last_rep_time": 0.0,
                         "angle_buffer": [],
                         "current_exercise": "Unknown",
+                        "good_reps": 0,
+                        "bad_reps": 0,
+                        "last_feedback": "",
+                        "last_feedback_time": 0.0,
                     }
 
-                    step_counter = 0
                     last_conf = 0.0
+                    no_pose_frames = 0
+                    feedback_state = {"text": "", "changed_at": 0.0}
+
+                elif cmd == "PAUSE_SESSION":
+                    session_manager.pause_session()
+
+                elif cmd == "RESUME_SESSION":
+                    session_manager.resume_session()
+
+                elif cmd == "SELECT_EXERCISE":
+                    exercise_name = message.get("exerciseName")
+                    if exercise_name not in plan_exercises:
+                        await websocket.send_text(json.dumps({"error": "Exercise is not part of this plan"}))
+                        continue
+                    manual_exercise = exercise_name
+                    feature_extractor.reset()
+                    pred_buf.clear()
+                    stable_ex = "Unknown"
+                    lock_ex = "Unknown"
+                    lock_until = 0.0
+                    last_conf = 0.0
+                    last_logged_stable = ""
+                    no_pose_frames = 0
+                    feedback_state = {"text": "", "changed_at": 0.0}
+                    rep_state = {
+                        "stage": "waiting_start",
+                        "phase_frames": 0,
+                        "reps": 0,
+                        "last_rep_time": 0.0,
+                        "angle_buffer": [],
+                        "current_exercise": manual_exercise,
+                        "good_reps": 0,
+                        "bad_reps": 0,
+                        "last_feedback": "",
+                        "last_feedback_time": 0.0,
+                    }
 
                 elif cmd == "END_SESSION":
                     summary = session_manager.end_session()
+                    if summary is None:
+                        await websocket.send_text(json.dumps({"error": "No active session"}))
+                        continue
+
+                    if current_user_id:
+                        session_data = {
+                            'duration': summary.get('durationSeconds', 0),
+                            'exercise_name': summary.get('mostFrequentExercise', 'Unknown'),
+                            'total_reps': summary.get('totalReps', 0),
+                            'form_quality': summary.get('formQuality', 100),
+                            'speed_warnings_count': summary.get('speedWarningsCount', 0),
+                            'exercise_results': summary.get('exerciseResults', []),
+                            'plan_id': summary.get('planId'),
+                            'assignment_id': summary.get('assignmentId'),
+                            'landmarks': [],
+                        }
+                        session_id = save_session(current_user_id, session_data)
+                        summary["sessionId"] = session_id
                     await websocket.send_text(json.dumps({"summary": summary}))
 
                 continue
@@ -515,32 +1018,55 @@ async def websocket_endpoint(websocket: WebSocket):
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             detection_result = landmarker.detect(mp_image)
 
+            active_exercise_name = manual_exercise or str(
+                rep_state.get("current_exercise", "Unknown")
+            )
+            active_target = plan_target_for_exercise(plan_exercises, active_exercise_name)
+            active_target_reps = max(int((active_target or {}).get("targetReps", 12)), 1)
+            active_target_sets = max(int((active_target or {}).get("targetSets", 3)), 1)
+            active_reps = int(rep_state.get("reps", 0))
+
             response = {
                 "detectedExerciseLabel": "Unknown",
                 "confidenceScore": 0.0,
-                "repCount": int(rep_state.get("reps", 0)),
+                "repCount": active_reps,
                 "angleValue": 0.0,
                 "angleError": 0.0,
-                "feedbackText": "No pose detected",
+                "feedbackText": "",
+                "currentExercise": active_exercise_name,
+                "currentSet": min((active_reps // active_target_reps) + 1, active_target_sets),
+                "setsCompleted": min(active_reps // active_target_reps, active_target_sets),
+                "targetReps": active_target_reps,
+                "targetSets": active_target_sets,
             }
 
-            if detection_result.pose_landmarks:
-                landmarks = detection_result.pose_landmarks[0]
-                ff = compute_frame_features_from_landmarks(landmarks)
+            frame_height, frame_width = frame.shape[:2]
+            landmarks = detection_result.pose_landmarks[0] if detection_result.pose_landmarks else None
+            if landmarks is None:
+                no_pose_frames += 1
+                if no_pose_frames >= NO_POSE_CONFIRM_FRAMES:
+                    response["feedbackText"] = "Step back and keep your full body in view"
+            else:
+                no_pose_frames = 0
+            feature_row = feature_extractor.add(landmarks, frame_width, frame_height)
 
-                if ff.get("valid", 0.0) < 1.0:
-                    await websocket.send_text(json.dumps(response))
-                    continue
+            if landmarks is not None and not feature_extractor.last_frame_valid:
+                response["feedbackText"] = "Move fully into view"
+                response["feedbackText"] = steady_feedback(response["feedbackText"], feedback_state)
+                await websocket.send_text(json.dumps(response))
+                continue
 
-                frame_buf.append(ff)
-                step_counter += 1
+            if landmarks is not None:
 
                 detected_label = "Unknown"
                 conf = 0.0
 
-                if len(frame_buf) >= WINDOW_SIZE and (step_counter % WINDOW_STEP == 0):
-                    x = build_window_vector(list(frame_buf), feature_order)
-                    x_df = pd.DataFrame(x, columns=feature_order)
+                if feature_row is not None:
+                    x_df = pd.DataFrame(
+                        [[feature_row[name] for name in feature_order]],
+                        columns=feature_order,
+                        dtype=np.float64,
+                    )
 
                     probs = classifier.predict_proba(x_df)[0]
                     order_idx = np.argsort(probs)[::-1]
@@ -562,10 +1088,22 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     print(f"[RAW] {detected_label} conf={conf:.3f} margin={margin:.3f}")
 
-                if USE_MOVEMENT_GATE and len(frame_buf) >= WINDOW_SIZE:
-                    window_vals = np.array([f.get("knee_L_deg", 0.0) for f in frame_buf], dtype=np.float64)
-
-                    if np.nanstd(window_vals) < MOVE_STD_THRESHOLD:
+                if USE_MOVEMENT_GATE and feature_row is not None:
+                    if detected_label in {"Ex1", "Ex2"}:
+                        movement_std = feature_row.get("shoulder_abd_deg_std", 0.0)
+                    elif detected_label == "Ex3":
+                        movement_std = (
+                            feature_row.get("elbow_L_deg_std", 0.0)
+                            + feature_row.get("elbow_R_deg_std", 0.0)
+                        ) / 2.0
+                    elif detected_label == "Ex4":
+                        movement_std = feature_row.get("hip_abd_deg_std", 0.0)
+                    else:
+                        movement_std = (
+                            feature_row.get("knee_L_deg_std", 0.0)
+                            + feature_row.get("knee_R_deg_std", 0.0)
+                        ) / 2.0
+                    if movement_std < MOVE_STD_THRESHOLD:
                         detected_label = "Unknown"
 
                 if detected_label != "Unknown":
@@ -588,35 +1126,108 @@ async def websocket_endpoint(websocket: WebSocket):
                 else:
                     stable_ex = voted
 
-                print(f"[STABLE] {stable_ex}")
+                if stable_ex != last_logged_stable:
+                    print(f"[STABLE] {last_logged_stable or 'None'} -> {stable_ex}")
+                    last_logged_stable = stable_ex
 
-                display_name = ex_names.get(stable_ex, stable_ex)
+                classified_name = ex_names.get(stable_ex, stable_ex)
+                display_name = manual_exercise or classified_name
 
-                if stable_ex != "Unknown" and rep_state.get("current_exercise") != display_name:
+                if manual_exercise:
+                    expected_class = expected_class_for_exercise(manual_exercise)
+                    if stable_ex != expected_class:
+                        actual_exercise = classified_name if stable_ex != "Unknown" else "Analyzing..."
+                        response.update({
+                            "detectedExerciseLabel": actual_exercise,
+                            "currentExercise": manual_exercise,
+                            "confidenceScore": float(last_conf),
+                            "feedbackText": (
+                                f"Do {manual_exercise}. Detected: {actual_exercise}"
+                                if stable_ex != "Unknown"
+                                else f"Hold on—checking for {manual_exercise}"
+                            ),
+                            "repCount": int(rep_state.get("reps", 0)),
+                            "formQuality": 0.0,
+                            "goodFormReps": int(rep_state.get("good_reps", 0)),
+                            "repPhase": "exercise_check",
+                            "measuredSide": "none",
+                            "exerciseMatched": False,
+                        })
+                        response["feedbackText"] = steady_feedback(response["feedbackText"], feedback_state)
+                        await websocket.send_text(json.dumps(response))
+                        continue
+
+                if display_name != "Unknown" and rep_state.get("current_exercise") != display_name:
                     rep_state = {
-                        "stage": "start",
+                        "stage": "waiting_start",
+                        "phase_frames": 0,
                         "reps": 0,
                         "last_rep_time": 0.0,
                         "angle_buffer": [],
                         "current_exercise": display_name,
+                        "good_reps": 0,
+                        "bad_reps": 0,
+                        "last_feedback": "",
+                        "last_feedback_time": 0.0,
                     }
 
-                if stable_ex != "Unknown":
-                    angle_value, target = angle_for_exercise(display_name, landmarks)
-                    reps = rep_update(display_name, angle_value, rep_state)
+                if display_name != "Unknown":
+                    angle_value, target, rep_exercise_key, measured_side = angle_for_exercise(
+                        display_name, landmarks, frame_width, frame_height
+                    )
+                    previous_reps = int(rep_state.get("reps", 0))
+                    reps, speed_warning = rep_update(display_name, angle_value, rep_state)
 
                     angle_used = float(rep_state.get("angle_smoothed", angle_value))
                     angle_error = angle_used - target
+                    best_rep_error = min(
+                        float(rep_state.get("best_rep_error", float("inf"))), abs(angle_error)
+                    )
 
-                    feedback = "Good rep!"
-
-                    if abs(angle_error) > 8:
-                        if "squat" in display_name.lower() or "lunge" in display_name.lower():
-                            feedback = "Go deeper" if angle_error > 0 else "Too deep"
+                    # Count form once per completed repetition, rather than once per video frame.
+                    if reps > previous_reps:
+                        form_tolerance = float(REP_PROFILES[rep_exercise_key]["tolerance"])
+                        if best_rep_error <= form_tolerance:
+                            rep_state["good_reps"] = int(rep_state.get("good_reps", 0)) + 1
                         else:
-                            feedback = "Raise a bit higher" if angle_error > 0 else "Lower a bit"
+                            rep_state["bad_reps"] = int(rep_state.get("bad_reps", 0)) + 1
+                        rep_state["best_rep_error"] = float("inf")
+                    else:
+                        rep_state["best_rep_error"] = best_rep_error
 
-                    session_manager.update(display_name, reps)
+                    stage = str(rep_state.get("stage", "waiting_start"))
+                    if stage == "waiting_start":
+                        feedback = "Move to the starting position"
+                    elif stage == "ready":
+                        feedback = "Begin the movement with control"
+                    else:
+                        feedback = "Return to the starting position"
+
+                    if stage == "active" and abs(angle_error) > 20:
+                        if rep_exercise_key in {"squat", "forward_lunge", "hip_abduction"}:
+                            feedback = "Complete the range, then return slowly"
+                        else:
+                            feedback = "Control the return movement"
+
+                    total_reps_tracked = int(rep_state.get("good_reps", 0)) + int(rep_state.get("bad_reps", 0))
+                    form_quality = (
+                        100.0 if total_reps_tracked == 0
+                        else (int(rep_state.get("good_reps", 0)) / total_reps_tracked) * 100.0
+                    )
+                    exercise_target = plan_target_for_exercise(plan_exercises, display_name)
+                    # Never interpret a missing plan lookup as a one-rep set.
+                    target_reps = max(int((exercise_target or {}).get("targetReps", 12)), 1)
+                    target_sets = max(int((exercise_target or {}).get("targetSets", 3)), 1)
+                    sets_completed = min(reps // target_reps, target_sets)
+                    current_set = min((reps // target_reps) + 1, target_sets)
+                    session_manager.update(
+                        display_name,
+                        reps,
+                        form_quality,
+                        speed_warning,
+                        int(rep_state.get("good_reps", 0)),
+                        sets_completed,
+                    )
 
                     response = {
                         "detectedExerciseLabel": display_name,
@@ -625,8 +1236,31 @@ async def websocket_endpoint(websocket: WebSocket):
                         "angleValue": angle_used,
                         "angleError": angle_error,
                         "feedbackText": feedback,
+                        "speedWarning": speed_warning,
+                        "formQuality": float(form_quality),
+                        "goodFormReps": int(rep_state.get("good_reps", 0)),
+                        "currentSet": current_set,
+                        "setsCompleted": sets_completed,
+                        "targetReps": target_reps,
+                        "targetSets": target_sets,
+                        "setCompleted": (
+                            exercise_target is not None
+                            and reps > previous_reps
+                            and reps % target_reps == 0
+                        ),
+                        "exerciseComplete": (
+                            exercise_target is not None
+                            and reps >= target_reps * target_sets
+                        ),
+                        "repPhase": stage,
+                        "measuredSide": measured_side,
+                        "currentExercise": display_name,
+                        "exerciseMatched": True,
                     }
 
+            response["feedbackText"] = steady_feedback(
+                str(response.get("feedbackText", "")), feedback_state
+            )
             await websocket.send_text(json.dumps(response))
 
     except WebSocketDisconnect:

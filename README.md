@@ -1,403 +1,217 @@
-# AI-Physiotherapy Repetition Counter
+# re+active Physio AI
 
-A web-based **AI physiotherapy assistant** that uses **MediaPipe pose estimation**, a trained **exercise classification model**, and a **rule-based repetition counter** to monitor rehabilitation exercises in real time.
+re+active is an AI-assisted rehabilitation web application. Patients can follow rehabilitation plans, receive live pose feedback, count repetitions and sets, and review session progress. Doctors can link patients, assign plans, and review patient analytics.
 
-The rebuilt project keeps the original design direction, including a **black and neon purple interface**, a **3D hero section**, and a **camera-based exercise session page**.
+## Technology
 
----
+- Frontend: React, TypeScript, Vite, Tailwind CSS, Three.js and Recharts
+- Backend: FastAPI, MediaPipe, OpenCV, pandas and scikit-learn
+- Communication: REST APIs and WebSockets
+- Storage: SQLite for the current local version
+- Machine learning: MediaPipe Pose Landmarker and an exercise classifier
 
-## Project Overview
+## Project structure
 
-This project is divided into two main parts:
-
-| Part | Description |
-|---|---|
-| `frontend/` | Vite + React user interface for the website and camera session page |
-| `backend/` | FastAPI WebSocket server that processes webcam frames using MediaPipe and the trained classifier |
-
-The system receives video frames from the frontend, processes body landmarks using MediaPipe, predicts the exercise type using the trained machine learning model, counts repetitions using rule-based logic, and sends the results back to the frontend in real time.
-
----
-
-## Folder Structure
-
-```bash
-Physio-AI-App/
-│
+```text
+FYP Web/
+├── backend/
+│   ├── main.py
+│   ├── database.py
+│   ├── auth.py
+│   ├── pose_features.py
+│   ├── session_manager.py
+│   ├── rehabilitation_plans.json
+│   ├── requirements.txt
+│   ├── models/
+│   └── tests/
 ├── frontend/
 │   ├── src/
 │   ├── public/
 │   ├── package.json
-│   ├── vite.config.js
 │   └── .env.example
-│
-├── backend/
-│   ├── main.py
-│   ├── requirements.txt
-│   ├── models/
-│   │   ├── pose_landmarker_lite.task
-│   │   └── exercise_classifier_best.pkl
-│   └── .gitignore
-│
-├── README.md
-└── .gitignore
+└── README.md
 ```
 
----
+## Prerequisites
 
-## Model Files
+- Python 3.11 recommended
+- Node.js 18 or newer
+- npm
+- A webcam
+- The required files in `backend/models/` (download the classifier as described below)
 
-The backend requires two model files:
+See [backend/models/README.txt](backend/models/README.txt) for the model checklist.
 
-```bash
-backend/models/pose_landmarker_lite.task
-backend/models/exercise_classifier_best.pkl
+### Download the exercise classifier
+
+The 168 MB classifier is distributed as a GitHub release asset instead of being
+stored in Git history. From the repository root, download it to the required
+runtime location:
+
+```powershell
+Invoke-WebRequest -Uri "https://github.com/JeffLoh03/AI-Physiotherapy_Website/releases/download/model-v1/exercise_classifier_best.pkl" -OutFile "backend/models/exercise_classifier_best.pkl"
 ```
 
-The trained exercise classification model can be downloaded from Google Drive:
+You can also download `exercise_classifier_best.pkl` from the
+[`model-v1` release](https://github.com/JeffLoh03/AI-Physiotherapy_Website/releases/tag/model-v1)
+and place it in `backend/models/` manually.
 
-[Download exercise classifier model](https://drive.google.com/file/d/1n9cGPcyNe9nRnaOw261G--XQzeJkMb4n/view?usp=drive_link)
+## Run locally
 
-After downloading, place the model file inside:
+The backend and frontend run in separate terminals.
 
-```bash
-backend/models/
-```
+### Terminal 1: backend
 
-Your final model folder should look like this:
+From the repository root:
 
-```bash
-backend/models/
-├── pose_landmarker_lite.task
-└── exercise_classifier_best.pkl
-```
-
----
-
-## Important GitHub Note
-
-Large model files should usually **not** be pushed directly to GitHub.
-
-Add the following lines to your `.gitignore` file:
-
-```gitignore
-backend/models/*.pkl
-backend/models/*.task
-backend/.venv/
-frontend/node_modules/
-.env
-```
-
-This keeps your repository clean and avoids uploading large or environment-specific files.
-
-Instead, upload the model file to Google Drive and provide the download link in this README.
-
----
-
-## Requirements
-
-Before running the project, make sure you have installed:
-
-| Tool | Purpose |
-|---|---|
-| Python 3.10 or above | Backend server |
-| Node.js 18 or above | Frontend React app |
-| npm | Install frontend dependencies |
-| Git | Version control |
-
----
-
-## Running the Project Locally
-
-### 1. Clone the Repository
-
-```bash
-git clone <your-repository-url>
-cd Physio-AI-App
-```
-
-Replace `<your-repository-url>` with your actual GitHub repository link.
-
----
-
-## Backend Setup
-
-Go to the backend folder:
-
-```bash
+```powershell
 cd backend
-```
-
-Create a virtual environment:
-
-```bash
 python -m venv .venv
-```
-
-Activate the virtual environment.
-
-For Windows:
-
-```bash
-.venv\Scripts\activate
-```
-
-For macOS or Linux:
-
-```bash
-source .venv/bin/activate
-```
-
-Install the required Python packages:
-
-```bash
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Make sure the required model files are placed inside:
+Set development secrets in the same PowerShell window. Replace the example values:
 
-```bash
-backend/models/
+```powershell
+$env:ENVIRONMENT="development"
+$env:APP_SECRET="replace-with-a-long-random-secret"
+$env:DOCTOR_INVITE_CODE="replace-with-a-private-clinician-code"
+$env:CORS_ORIGINS="http://localhost:3000"
+$env:AUTH_TOKEN_TTL_SECONDS="28800"
 ```
 
-Start the backend server:
+Start the API:
 
-```bash
+```powershell
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-The backend WebSocket server will run at:
+The backend is available at:
 
-```bash
-ws://localhost:8000/ws
-```
+- API: `http://localhost:8000`
+- Interactive API documentation: `http://localhost:8000/docs`
+- WebSocket: `ws://localhost:8000/ws`
 
----
+On macOS or Linux, activate the environment with `source .venv/bin/activate` and use `export NAME="value"` for environment variables.
 
-## Frontend Setup
+> The backend does not automatically load `backend/.env.example`. Set the variables in your shell or configure them through your hosting provider.
 
-Open a new terminal and go to the frontend folder:
+### Terminal 2: frontend
 
-```bash
+Open another terminal at the repository root:
+
+```powershell
 cd frontend
-```
-
-Install dependencies:
-
-```bash
 npm install
-```
-
-Create an environment file from the example file:
-
-```bash
-cp .env.example .env
-```
-
-For Windows Command Prompt, use:
-
-```bash
-copy .env.example .env
-```
-
-Inside `.env`, make sure the WebSocket URL is set correctly:
-
-```env
-VITE_WS_URL=ws://localhost:8000/ws
-```
-
-Run the frontend development server:
-
-```bash
+Copy-Item .env.example .env
 npm run dev
 ```
 
-Open the website using the URL printed by Vite. It is usually:
+Open `http://localhost:3000`.
 
-```bash
-http://localhost:5173
-```
-
----
-
-## WebSocket Configuration
-
-The frontend reads the backend WebSocket URL from:
+The local frontend environment should contain:
 
 ```env
-VITE_WS_URL
-```
-
-If no value is provided, the default WebSocket URL is:
-
-```bash
-ws://localhost:8000/ws
-```
-
-Use this setting when running locally:
-
-```env
+VITE_API_URL=http://localhost:8000
 VITE_WS_URL=ws://localhost:8000/ws
 ```
 
-If the backend is deployed online, replace the value with your deployed backend WebSocket URL.
+## Main workflow
 
-Example:
+1. Register a patient account, or register a doctor using the configured clinician invite code.
+2. A doctor searches for a patient and adds the patient to their persistent care list.
+3. The doctor assigns a rehabilitation plan.
+4. The patient starts the assigned plan from the patient dashboard.
+5. During a session, the camera sends frames to the FastAPI WebSocket for pose classification, form feedback, and repetition counting.
+6. Completed sessions appear in patient and doctor analytics.
 
-```env
-VITE_WS_URL=wss://your-backend-domain.com/ws
+## Development checks
+
+Run frontend checks:
+
+```powershell
+cd frontend
+npm run lint
+npm run build
 ```
 
----
+Run backend tests:
 
-## Main Features
-
-- Real-time camera-based exercise monitoring
-- MediaPipe pose landmark detection
-- Machine learning exercise classification
-- Confidence score display
-- Rule-based repetition counting
-- Real-time user feedback panel
-- Web-based interface using React
-- FastAPI backend with WebSocket communication
-- Clean black and neon purple UI design
-
----
-
-## Basic System Workflow
-
-```text
-User opens camera session
-        ↓
-Frontend captures webcam frames
-        ↓
-Frames are sent to FastAPI backend through WebSocket
-        ↓
-MediaPipe detects body landmarks
-        ↓
-Feature extraction is performed
-        ↓
-Machine learning model predicts exercise type
-        ↓
-Rule-based logic counts repetitions
-        ↓
-Backend sends prediction, confidence score, feedback, and count back to frontend
-        ↓
-Frontend displays results in real time
+```powershell
+cd backend
+python -m unittest discover -s tests -v
 ```
 
----
+## Environment variables
 
-## Common Issues and Fixes
+### Backend
 
-### 1. Backend cannot find model file
+| Variable | Purpose |
+| --- | --- |
+| `ENVIRONMENT` | Use `development` locally and `production` when deployed |
+| `APP_SECRET` | Signs authentication tokens; use a long private value |
+| `DOCTOR_INVITE_CODE` | Required when registering a doctor account |
+| `CORS_ORIGINS` | Comma-separated frontend origins allowed to call the API |
+| `AUTH_TOKEN_TTL_SECONDS` | Login-token lifetime in seconds |
 
-Make sure the model files are inside:
+### Frontend
 
-```bash
-backend/models/
+| Variable | Purpose |
+| --- | --- |
+| `VITE_API_URL` | Public FastAPI base URL |
+| `VITE_WS_URL` | Public session WebSocket URL |
+
+Never commit real secrets or a production `.env` file.
+
+## Data and model notes
+
+- The SQLite database is created and migrated automatically as `backend/app_data.db`.
+- The database file and local environment files are intentionally ignored by Git.
+- One pose feature extractor is created per WebSocket session so different users do not share pose history.
+- The saved classifier and `feature_order.json` must match the 132 features produced by `pose_features.py`.
+- Only load trusted `.pkl` or joblib model files.
+
+## Deployment overview
+
+Deploy the two applications separately:
+
+- `frontend/`: static Vite site built with `npm ci && npm run build`; publish `dist/`
+- `backend/`: Python web service built with `pip install -r requirements.txt`; start with `uvicorn main:app --host 0.0.0.0 --port $PORT`
+
+For production:
+
+- Use `https://` for `VITE_API_URL` and `wss://` for `VITE_WS_URL`.
+- Set `ENVIRONMENT=production` and configure all secrets through the host.
+- Set `CORS_ORIGINS` to the exact deployed frontend origin.
+- Move SQLite to persistent storage or migrate to PostgreSQL before storing real data.
+- The classifier is published as the `model-v1` GitHub release asset. Download it during deployment or include it in the backend container image.
+
+## Troubleshooting
+
+### Camera does not start
+
+- Allow camera permission in the browser.
+- Keep the complete body visible with suitable lighting.
+- Deployed camera access requires HTTPS.
+
+### Backend cannot load the model
+
+- Confirm every required file listed in `backend/models/README.txt` is present.
+- Confirm `feature_order.json` matches the classifier training columns.
+
+### Frontend cannot reach the backend
+
+- Confirm both servers are running.
+- Check `VITE_API_URL`, `VITE_WS_URL`, and `CORS_ORIGINS`.
+- Restart the Vite server after changing frontend environment variables.
+
+### PowerShell blocks virtual-environment activation
+
+Run Python through the environment directly:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
-
-Required files:
-
-```bash
-pose_landmarker_lite.task
-exercise_classifier_best.pkl
-```
-
----
-
-### 2. Frontend cannot connect to backend
-
-Check that the backend is running:
-
-```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
-
-Then check your `.env` file:
-
-```env
-VITE_WS_URL=ws://localhost:8000/ws
-```
-
-Restart the frontend after editing `.env`:
-
-```bash
-npm run dev
-```
-
----
-
-### 3. Camera is not working
-
-Make sure:
-
-- Browser camera permission is allowed
-- No other application is using the webcam
-- The website is opened in a modern browser such as Chrome or Edge
-
----
-
-### 4. `npm install` error
-
-Try deleting `node_modules` and reinstalling:
-
-```bash
-rm -rf node_modules package-lock.json
-npm install
-```
-
-For Windows, manually delete the `node_modules` folder and `package-lock.json`, then run:
-
-```bash
-npm install
-```
-
----
-
-## Suggested Repository Structure for GitHub
-
-Before pushing to GitHub, make sure your repository does not include:
-
-```bash
-backend/.venv/
-frontend/node_modules/
-backend/models/*.pkl
-backend/models/*.task
-.env
-```
-
-Only push the source code, configuration files, and README.
-
-Recommended command:
-
-```bash
-git add .
-git commit -m "Initial commit for Physio AI App"
-git push origin main
-```
-
----
-
-## Project Status
-
-This project is currently developed as a final year project prototype. The system has completed three main implementation components:
-
-1. Machine learning model training for exercise classification
-2. Rule-based repetition counter development and evaluation
-3. Web application integration for real-time physiotherapy monitoring
-
----
-
-## Author
-
-**Jeff Loh Wei Kit**  
-Bachelor in Digital Health (Hons)  
-IMU University
-
----
-
-## Disclaimer
-
-This application is developed for academic and prototype purposes. It is not intended to replace professional physiotherapy assessment, clinical diagnosis, or medical advice.

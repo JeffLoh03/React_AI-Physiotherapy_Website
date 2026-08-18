@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .venv/
+app_data.db
+.env
+.env.*
+!.env.example
+models/exercise_classifier_best.pkl

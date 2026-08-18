@@ -10,6 +10,9 @@ interface FeedbackPanelProps {
   angleError: number;
   feedbackText: string;
   repCount: number;
+  repPhase: string;
+  measuredSide: string;
+  exerciseMatched: boolean;
   onReconnect: () => void;
 }
 
@@ -21,16 +24,22 @@ export default function FeedbackPanel({
   angleError,
   feedbackText,
   repCount,
+  repPhase,
+  measuredSide,
+  exerciseMatched,
   onReconnect
 }: FeedbackPanelProps) {
   
-  const isGood = Math.abs(angleError) <= 8;
+  const isGood = exerciseMatched && Math.abs(angleError) <= 20;
   const confidencePercent = Math.round(confidenceScore * 100);
 
   let statusColor = "text-neon-cyan";
   let borderColor = "border-neon-cyan";
   
-  if (!isGood) {
+  if (!exerciseMatched) {
+    statusColor = "text-yellow-400";
+    borderColor = "border-yellow-500";
+  } else if (!isGood) {
     statusColor = "text-neon-purple";
     borderColor = "border-neon-purple";
   }
@@ -93,6 +102,9 @@ export default function FeedbackPanel({
               {angleError > 0 ? "+" : ""}{angleError.toFixed(0)}°
             </div>
           </div>
+        </div>
+        <div className="mt-3 text-[10px] uppercase tracking-wider text-gray-400">
+          Phase: {repPhase.replace('_', ' ')} • Tracking: {measuredSide}
         </div>
       </div>
 
