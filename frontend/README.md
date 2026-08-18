@@ -1,71 +1,102 @@
-# AI-Physio Assistant (MVP)
+# re+active Frontend
 
-A proposal-compliant web prototype for real-time exercise classification and feedback.
+This directory contains the React and TypeScript user interface for re+active Physio AI.
 
-## 1. Prerequisites
+For complete backend and frontend setup, see the [project README](../README.md).
 
-- Node.js (v18+)
-- Python (v3.9+)
+## Requirements
 
-## 2. Setup & Installation
+- Node.js 18 or newer
+- npm
+- The FastAPI backend running locally or at a public URL
 
-### Frontend (Web)
-The frontend is located in the root directory.
-```bash
+## Install and run
+
+From the repository root:
+
+```powershell
+cd frontend
 npm install
+Copy-Item .env.example .env
 npm run dev
 ```
-Access at `http://localhost:5173`.
 
-### Backend (Server)
-The backend is located in `/server`.
-```bash
-cd server
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+Open `http://localhost:3000`.
+
+On macOS or Linux, copy the environment file with `cp .env.example .env`.
+
+## Environment configuration
+
+Local defaults:
+
+```env
+VITE_API_URL=http://localhost:8000
+VITE_WS_URL=ws://localhost:8000/ws
 ```
 
-## 3. CRITICAL: Manual File Copy
+| Variable | Description |
+| --- | --- |
+| `VITE_API_URL` | FastAPI base URL used for authentication, plans, profiles and analytics |
+| `VITE_WS_URL` | WebSocket URL used for live camera sessions |
 
-You **MUST** copy your trained models and logic files into the `/server` directory:
+After changing `.env`, restart `npm run dev` because Vite reads these values at startup.
 
-1.  **Model**: Copy `pose_landmarker_lite.task` -> `/server/models/`
-2.  **Classifier**: Copy `exercise_classifier_best.pkl` -> `/server/models/`
-3.  **Logic**: Copy `rep_counter_rule_based.py` -> `/server/`
+For a deployed site, use HTTPS equivalents:
 
-**Directory Structure Check:**
-```
-/server
-  /models
-    pose_landmarker_lite.task
-    exercise_classifier_best.pkl
-  rep_counter_rule_based.py
-  pose_features.py
-  session_manager.py
-  main.py
-  requirements.txt
+```env
+VITE_API_URL=https://api.example.com
+VITE_WS_URL=wss://api.example.com/ws
 ```
 
-## 4. Running the Backend
+Do not place passwords, backend secrets, or clinician invite codes in `VITE_` variables. Vite variables are included in the browser bundle.
 
-```bash
-cd server
-python main.py
+## Available commands
+
+Run all commands from `frontend/`:
+
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Start the development server on port 3000 |
+| `npm run lint` | Run TypeScript validation without emitting files |
+| `npm run build` | Create a production build in `dist/` |
+| `npm run preview` | Preview the production build locally |
+| `npm run clean` | Remove the generated `dist/` directory |
+
+## Main routes
+
+| Route | Description |
+| --- | --- |
+| `/` | Public landing page |
+| `/auth` | Patient and doctor sign-in/registration |
+| `/patient-dashboard` | Protected patient plans and analytics |
+| `/doctor-dashboard` | Protected care list, plan assignment and patient analytics |
+| `/session` | Protected live patient rehabilitation session |
+
+Protected routes require a valid backend authentication token and the correct account role.
+
+## Important directories
+
+```text
+frontend/
+├── public/                 Static assets and the public plan copy
+├── src/components/         Reusable interface components
+├── src/lib/                API, frame capture and chart helpers
+├── src/pages/              Route-level pages
+├── src/App.tsx             Routes and route protection
+├── src/index.css           Global styles
+├── package.json            Dependencies and scripts
+└── vite.config.ts          Vite configuration
 ```
-WebSocket will start at `ws://localhost:8000/ws`.
 
-## 5. Usage Guide
+## Production build
 
-1.  **Start**: Open the web app and click "Start Live Session".
-2.  **Webcam**: Allow camera access.
-3.  **Real-time**:
-    -   Perform exercises in view of the camera.
-    -   The panel will show the **Detected Exercise** and **Confidence Score**.
-    -   Feedback ("Raise/Lower") is based on the angle of the detected joint.
-4.  **End Session**: Click "End" to view the summary and download the JSON report.
+```powershell
+cd frontend
+npm ci
+npm run lint
+npm run build
+```
 
-## 6. Troubleshooting
+Deploy the generated `dist/` directory as a static site. Configure the host to rewrite unknown paths to `/index.html` so React Router routes work after a browser refresh.
 
--   **Classification Error**: If the classifier fails, check `pose_features.py`. The feature vector MUST match the columns used during training.
--   **Camera Blocked**: Ensure browser permissions are allowed.
+Camera access requires permission from the user and a secure HTTPS origin when deployed.

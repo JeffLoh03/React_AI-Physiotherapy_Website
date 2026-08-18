@@ -1,0 +1,161 @@
+{
+  "plans": [
+    {
+      "planId": "knee_recovery_v1",
+      "name": "Knee Recovery",
+      "description": "Post-injury knee rehabilitation focusing on strength and mobility",
+      "difficulty": "Beginner",
+      "durationWeeks": 4,
+      "exercises": [
+        {
+          "name": "Squat",
+          "targetReps": 15,
+          "targetSets": 3,
+          "restSeconds": 60,
+          "notes": "Go to 90° depth, controlled movement",
+          "order": 1
+        },
+        {
+          "name": "Hip Abduction",
+          "targetReps": 12,
+          "targetSets": 3,
+          "restSeconds": 45,
+          "notes": "Slow and controlled, full range of motion",
+          "order": 2
+        },
+        {
+          "name": "Lunge",
+          "targetReps": 10,
+          "targetSets": 3,
+          "restSeconds": 60,
+          "notes": "Step forward, lower back knee near ground",
+          "order": 3
+        }
+      ]
+    },
+    {
+      "planId": "shoulder_rehab_v1",
+      "name": "Shoulder Rehabilitation",
+      "description": "Shoulder mobility and rotator cuff strengthening",
+      "difficulty": "Intermediate",
+      "durationWeeks": 6,
+      "exercises": [
+        {
+          "name": "Shoulder",
+          "targetReps": 12,
+          "targetSets": 3,
+          "restSeconds": 45,
+          "notes": "Raise arm to shoulder height, controlled",
+          "order": 1
+        },
+        {
+          "name": "V-W",
+          "targetReps": 15,
+          "targetSets": 3,
+          "restSeconds": 45,
+          "notes": "Form V shape, then W shape with arms",
+          "order": 2
+        },
+        {
+          "name": "Push",
+          "targetReps": 10,
+          "targetSets": 3,
+          "restSeconds": 60,
+          "notes": "Full range of motion, feel the burn",
+          "order": 3
+        }
+      ]
+    },
+    {
+      "planId": "general_fitness_v1",
+      "name": "General Fitness",
+      "description": "Full body workout combining upper and lower body exercises",
+      "difficulty": "Intermediate",
+      "durationWeeks": 3,
+      "exercises": [
+        {
+          "name": "Squat",
+          "targetReps": 12,
+          "targetSets": 3,
+          "restSeconds": 60,
+          "notes": "Standard squat form",
+          "order": 1
+        },
+        {
+          "name": "Push",
+          "targetReps": 10,
+          "targetSets": 3,
+          "restSeconds": 60,
+          "notes": "Full body push movement",
+          "order": 2
+        },
+        {
+          "name": "Hip Abduction",
+          "targetReps": 12,
+          "targetSets": 3,
+          "restSeconds": 45,
+          "notes": "Hip strength and stability",
+          "order": 3
+        }
+      ]
+    },
+    {
+      "planId": "advanced_strength_v1",
+      "name": "Advanced Strength",
+      "description": "High-intensity strength training for experienced users",
+      "difficulty": "Advanced",
+      "durationWeeks": 8,
+      "exercises": [
+        {
+          "name": "Squat",
+          "targetReps": 20,
+          "targetSets": 4,
+          "restSeconds": 90,
+          "notes": "Deep squats, full range",
+          "order": 1
+        },
+        {
+          "name": "Push",
+          "targetReps": 15,
+          "targetSets": 4,
+          "restSeconds": 90,
+          "notes": "High intensity push exercises",
+          "order": 2
+        },
+        {
+          "name": "Lunge",
+          "targetReps": 12,
+          "targetSets": 3,
+          "restSeconds": 75,
+          "notes": "Alternating lunges, controlled descent",
+          "order": 3
+        },
+        {
+          "name": "Hip Abduction",
+          "targetReps": 15,
+          "targetSets": 3,
+          "restSeconds": 60,
+          "notes": "Explosive movements for strength",
+          "order": 4
+        }
+      ]
+    },
+    {
+      "planId": "shoulder_vw_focus_v1",
+      "name": "V-W Shoulder Focus",
+      "description": "A focused shoulder mobility plan containing only the V-W exercise",
+      "difficulty": "Beginner",
+      "durationWeeks": 4,
+      "exercises": [
+        {
+          "name": "V-W",
+          "targetReps": 12,
+          "targetSets": 3,
+          "restSeconds": 45,
+          "notes": "Move from a controlled V position into a W, then return fully",
+          "order": 1
+        }
+      ]
+    }
+  ]
+}
